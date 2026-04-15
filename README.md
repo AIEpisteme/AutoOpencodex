@@ -9,6 +9,12 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 </br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
 
 ---
+###
+This is fork for OpenAI's Codex, added AGENTS.override.md with automated end to end software development full cycle. 
+- AGENTS.override.md - This agent is responsible for fully automated, end-to-end, production-grade software delivery. It takes a product objective from initial intake through planning, requirements definition, architecture, code generation, debugging, testing, integration, deployment, and production operations.
+
+- Skills - superplan,Produce a comprehensive end-to-end software delivery plan for product, platform, or infrastructure work.
+ 
 
 ## Quickstart
 
@@ -16,7 +22,7 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 Install globally with your preferred package manager:
 
-```shell
+```d
 # Install using npm
 npm install -g @openai/codex
 ```
