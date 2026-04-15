@@ -1,0 +1,6 @@
+interface:
+  display_name: "Super Plan"
+  short_description: "Full-cycle software delivery planning"
+  default_prompt: "Use $superplan to produce a comprehensive end-to-end software delivery plan for this task."
+policy:
+  allow_implicit_invocation: false
