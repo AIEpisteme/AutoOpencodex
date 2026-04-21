@@ -289,6 +289,11 @@ client_request_definitions! {
         params: v2::ThreadMemoryModeSetParams,
         response: v2::ThreadMemoryModeSetResponse,
     },
+    #[experimental("memory/reset")]
+    MemoryReset => "memory/reset" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        response: v2::MemoryResetResponse,
+    },
     ThreadUnarchive => "thread/unarchive" {
         params: v2::ThreadUnarchiveParams,
         response: v2::ThreadUnarchiveResponse,
@@ -322,6 +327,10 @@ client_request_definitions! {
         params: v2::ThreadReadParams,
         response: v2::ThreadReadResponse,
     },
+    ThreadTurnsList => "thread/turns/list" {
+        params: v2::ThreadTurnsListParams,
+        response: v2::ThreadTurnsListResponse,
+    },
     /// Append raw Responses API items to the thread history without starting a user turn.
     ThreadInjectItems => "thread/inject_items" {
         params: v2::ThreadInjectItemsParams,
@@ -335,6 +344,10 @@ client_request_definitions! {
         params: v2::MarketplaceAddParams,
         response: v2::MarketplaceAddResponse,
     },
+    MarketplaceRemove => "marketplace/remove" {
+        params: v2::MarketplaceRemoveParams,
+        response: v2::MarketplaceRemoveResponse,
+    },
     PluginList => "plugin/list" {
         params: v2::PluginListParams,
         response: v2::PluginListResponse,
@@ -346,6 +359,18 @@ client_request_definitions! {
     AppsList => "app/list" {
         params: v2::AppsListParams,
         response: v2::AppsListResponse,
+    },
+    DeviceKeyCreate => "device/key/create" {
+        params: v2::DeviceKeyCreateParams,
+        response: v2::DeviceKeyCreateResponse,
+    },
+    DeviceKeyPublic => "device/key/public" {
+        params: v2::DeviceKeyPublicParams,
+        response: v2::DeviceKeyPublicResponse,
+    },
+    DeviceKeySign => "device/key/sign" {
+        params: v2::DeviceKeySignParams,
+        response: v2::DeviceKeySignResponse,
     },
     FsReadFile => "fs/readFile" {
         params: v2::FsReadFileParams,
@@ -513,6 +538,11 @@ client_request_definitions! {
     GetAccountRateLimits => "account/rateLimits/read" {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
         response: v2::GetAccountRateLimitsResponse,
+    },
+
+    SendAddCreditsNudgeEmail => "account/sendAddCreditsNudgeEmail" {
+        params: v2::SendAddCreditsNudgeEmailParams,
+        response: v2::SendAddCreditsNudgeEmailResponse,
     },
 
     FeedbackUpload => "feedback/upload" {
@@ -759,6 +789,7 @@ macro_rules! server_notification_definitions {
             Display,
             ExperimentalApi,
         )]
+        #[allow(clippy::large_enum_variant)]
         #[serde(tag = "method", content = "params", rename_all = "camelCase")]
         #[strum(serialize_all = "camelCase")]
         pub enum ServerNotification {
@@ -1004,6 +1035,7 @@ server_notification_definitions! {
     CommandExecutionOutputDelta => "item/commandExecution/outputDelta" (v2::CommandExecutionOutputDeltaNotification),
     TerminalInteraction => "item/commandExecution/terminalInteraction" (v2::TerminalInteractionNotification),
     FileChangeOutputDelta => "item/fileChange/outputDelta" (v2::FileChangeOutputDeltaNotification),
+    FileChangePatchUpdated => "item/fileChange/patchUpdated" (v2::FileChangePatchUpdatedNotification),
     ServerRequestResolved => "serverRequest/resolved" (v2::ServerRequestResolvedNotification),
     McpToolCallProgress => "item/mcpToolCall/progress" (v2::McpToolCallProgressNotification),
     McpServerOauthLoginCompleted => "mcpServer/oauthLogin/completed" (v2::McpServerOauthLoginCompletedNotification),
@@ -1011,6 +1043,7 @@ server_notification_definitions! {
     AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
     AppListUpdated => "app/list/updated" (v2::AppListUpdatedNotification),
+    ExternalAgentConfigImportCompleted => "externalAgentConfig/import/completed" (v2::ExternalAgentConfigImportCompletedNotification),
     FsChanged => "fs/changed" (v2::FsChangedNotification),
     ReasoningSummaryTextDelta => "item/reasoning/summaryTextDelta" (v2::ReasoningSummaryTextDeltaNotification),
     ReasoningSummaryPartAdded => "item/reasoning/summaryPartAdded" (v2::ReasoningSummaryPartAddedNotification),
@@ -1018,6 +1051,7 @@ server_notification_definitions! {
     /// Deprecated: Use `ContextCompaction` item type instead.
     ContextCompacted => "thread/compacted" (v2::ContextCompactedNotification),
     ModelRerouted => "model/rerouted" (v2::ModelReroutedNotification),
+    Warning => "warning" (v2::WarningNotification),
     DeprecationNotice => "deprecationNotice" (v2::DeprecationNoticeNotification),
     ConfigWarning => "configWarning" (v2::ConfigWarningNotification),
     FuzzyFileSearchSessionUpdated => "fuzzyFileSearch/sessionUpdated" (FuzzyFileSearchSessionUpdatedNotification),
@@ -2034,6 +2068,8 @@ mod tests {
                 file_system: Some(v2::AdditionalFileSystemPermissions {
                     read: Some(vec![absolute_path("/tmp/allowed")]),
                     write: None,
+                    glob_scan_max_depth: None,
+                    entries: None,
                 }),
             }),
             proposed_execpolicy_amendment: None,

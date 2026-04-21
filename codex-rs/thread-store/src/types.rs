@@ -11,6 +11,7 @@ use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
 use codex_protocol::protocol::TokenUsage;
 use serde::Deserialize;
 use serde::Serialize;
@@ -101,6 +102,16 @@ pub enum ThreadSortKey {
     UpdatedAt,
 }
 
+/// The direction to use when listing stored threads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortDirection {
+    /// Return older threads before newer threads.
+    Asc,
+    /// Return newer threads before older threads.
+    #[default]
+    Desc,
+}
+
 /// Parameters for listing threads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListThreadsParams {
@@ -110,6 +121,8 @@ pub struct ListThreadsParams {
     pub cursor: Option<String>,
     /// Sort order requested by the caller.
     pub sort_key: ThreadSortKey,
+    /// Sort direction requested by the caller.
+    pub sort_direction: SortDirection,
     /// Allowed session sources. Empty means implementation default.
     pub allowed_sources: Vec<SessionSource>,
     /// Optional model provider filter. `None` means implementation default, while an empty vector
@@ -135,6 +148,8 @@ pub struct ThreadPage {
 pub struct StoredThread {
     /// Thread id.
     pub thread_id: ThreadId,
+    /// Local rollout path when the backing store is filesystem-based.
+    pub rollout_path: Option<PathBuf>,
     /// Source thread id when this thread was forked from another thread.
     pub forked_from_id: Option<ThreadId>,
     /// Best available user-facing preview, usually the first user message.
@@ -155,6 +170,8 @@ pub struct StoredThread {
     pub archived_at: Option<DateTime<Utc>>,
     /// Working directory captured for the thread.
     pub cwd: PathBuf,
+    /// CLI version captured for the thread.
+    pub cli_version: String,
     /// Runtime source for the thread.
     pub source: SessionSource,
     /// Optional random nickname for thread-spawn sub-agents.
@@ -177,15 +194,6 @@ pub struct StoredThread {
     pub history: Option<StoredThreadHistory>,
 }
 
-/// Parameters for setting a user-facing thread name.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SetThreadNameParams {
-    /// Thread id to update.
-    pub thread_id: ThreadId,
-    /// Normalized thread name.
-    pub name: String,
-}
-
 /// Optional field patch where omission leaves a value unchanged and `Some(None)` clears it.
 pub type OptionalStringPatch = Option<Option<String>>;
 
@@ -203,6 +211,10 @@ pub struct GitInfoPatch {
 /// Patch for mutable thread metadata.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadMetadataPatch {
+    /// Replacement user-facing thread name.
+    pub name: Option<String>,
+    /// Replacement thread memory behavior.
+    pub memory_mode: Option<MemoryMode>,
     /// Optional Git metadata patch.
     pub git_info: Option<GitInfoPatch>,
 }
@@ -214,6 +226,8 @@ pub struct UpdateThreadMetadataParams {
     pub thread_id: ThreadId,
     /// Patch to apply.
     pub patch: ThreadMetadataPatch,
+    /// Whether archived threads are eligible.
+    pub include_archived: bool,
 }
 
 /// Parameters for archiving or unarchiving a thread.
