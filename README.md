@@ -10,7 +10,7 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ---
 ###
-This is fork for OpenAI's Codex, added AGENTS.override.md with automated end to end software development full cycle. 
+This is fork for OpenAI's Codex, added AGENTS.override.md with automated end to end software development full cycle.   This is in development and experimental. 
 - AGENTS.override.md - This agent is responsible for fully automated, end-to-end, production-grade software delivery. It takes a product objective from initial intake through planning, requirements definition, architecture, code generation, debugging, testing, integration, deployment, and production operations.
 
 - Skills - superplan,Produce a comprehensive end-to-end software delivery plan for product, platform, or infrastructure work.
