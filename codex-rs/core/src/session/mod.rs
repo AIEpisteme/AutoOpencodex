@@ -14,7 +14,6 @@ use crate::agent::Mailbox;
 use crate::agent::MailboxReceiver;
 use crate::agent::agent_status_from_event;
 use crate::agent::status::is_final;
-use crate::agent_identity::AgentIdentityManager;
 use crate::build_available_skills;
 use crate::commit_attribution::commit_message_trailer_instruction;
 use crate::compact;
@@ -78,6 +77,7 @@ use codex_otel::current_span_w3c_trace_context;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::ThreadId;
 use codex_protocol::ToolName;
+use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::approvals::NetworkPolicyAmendment;
@@ -95,6 +95,7 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::format_allow_prefixes;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::FileChange;
@@ -119,12 +120,19 @@ use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputArgs;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
-use codex_rollout::RolloutConfig;
 use codex_rollout::state_db;
+use codex_rollout_trace::RolloutTraceRecorder;
+use codex_rollout_trace::ThreadStartedTraceMetadata;
 use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_shell_command::parse_command::parse_command;
 use codex_terminal_detection::user_agent;
+use codex_thread_store::CreateThreadParams;
+use codex_thread_store::LiveThread;
+use codex_thread_store::LiveThreadInitGuard;
 use codex_thread_store::LocalThreadStore;
+use codex_thread_store::ResumeThreadParams;
+use codex_thread_store::ThreadEventPersistenceMode;
+use codex_thread_store::ThreadStore;
 use codex_utils_output_truncation::TruncationPolicy;
 use futures::future::BoxFuture;
 use futures::future::Shared;
@@ -173,7 +181,6 @@ use codex_protocol::error::Result as CodexResult;
 #[cfg(test)]
 use codex_protocol::exec_output::StreamOutput;
 
-mod agent_task_lifecycle;
 mod handlers;
 mod mcp;
 mod review;
@@ -189,7 +196,7 @@ use self::review::spawn_review_thread;
 use self::session::AppServerClientMetadata;
 use self::session::Session;
 use self::session::SessionConfiguration;
-use self::session::SessionSettingsUpdate;
+pub(crate) use self::session::SessionSettingsUpdate;
 #[cfg(test)]
 use self::turn::AssistantMessageStreamParsers;
 #[cfg(test)]
@@ -265,11 +272,7 @@ use crate::mcp::McpManager;
 use crate::memories;
 use crate::network_policy_decision::execpolicy_network_rule_amendment;
 use crate::plugins::PluginsManager;
-use crate::rollout::RolloutRecorder;
-use crate::rollout::RolloutRecorderParams;
 use crate::rollout::map_session_init_error;
-use crate::rollout::metadata;
-use crate::rollout::policy::EventPersistenceMode;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use crate::shell;
 use crate::shell_snapshot::ShellSnapshot;
@@ -302,7 +305,7 @@ use crate::unified_exec::UnifiedExecProcessManager;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_git_utils::get_git_repo_root;
 use codex_mcp::compute_auth_statuses;
-use codex_mcp::with_codex_apps_mcp_with_authorization_header;
+use codex_mcp::with_codex_apps_mcp;
 use codex_otel::SessionTelemetry;
 use codex_otel::THREAD_STARTED_METRIC;
 use codex_otel::TelemetryAuthMode;
@@ -329,6 +332,8 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::ModelRerouteEvent;
 use codex_protocol::protocol::ModelRerouteReason;
+use codex_protocol::protocol::ModelVerification;
+use codex_protocol::protocol::ModelVerificationEvent;
 use codex_protocol::protocol::NetworkApprovalContext;
 use codex_protocol::protocol::NonSteerableTurnKind;
 use codex_protocol::protocol::Op;
@@ -373,8 +378,6 @@ pub struct Codex {
 
 pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
 
-pub(crate) const THREAD_START_SKILLS_TRIMMED_WARNING_MESSAGE: &str = "Some enabled skills were not included in the model-visible skills list for this session. Mention a skill by name or path if you need it.";
-
 /// Wrapper returned by [`Codex::spawn`] containing the spawned [`Codex`] and
 /// the unique session id.
 pub struct CodexSpawnOk {
@@ -399,9 +402,12 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) metrics_service_name: Option<String>,
     pub(crate) inherited_shell_snapshot: Option<Arc<ShellSnapshot>>,
     pub(crate) inherited_exec_policy: Option<Arc<ExecPolicyManager>>,
+    /// Parent rollout-tree recorder, or a disabled recorder when this spawn has no parent trace.
+    pub(crate) inherited_rollout_trace: RolloutTraceRecorder,
     pub(crate) user_shell_override: Option<shell::Shell>,
     pub(crate) parent_trace: Option<W3cTraceContext>,
     pub(crate) analytics_events_client: Option<AnalyticsEventsClient>,
+    pub(crate) thread_store: Arc<dyn ThreadStore>,
 }
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
@@ -454,16 +460,15 @@ impl Codex {
             inherited_shell_snapshot,
             user_shell_override,
             inherited_exec_policy,
+            inherited_rollout_trace,
             parent_trace: _,
             analytics_events_client,
+            thread_store,
         } = args;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
-        let environment = environment_manager
-            .current()
-            .await
-            .map_err(|err| CodexErr::Fatal(format!("failed to create environment: {err}")))?;
+        let environment = environment_manager.default_environment();
         let fs = environment
             .as_ref()
             .map(|environment| environment.get_filesystem());
@@ -601,11 +606,20 @@ impl Codex {
                 developer_instructions: None,
             },
         };
+        let account_plan_type = auth_manager
+            .auth_cached()
+            .and_then(|auth| auth.account_plan_type());
+        let service_tier = get_service_tier(
+            config.service_tier,
+            config.notices.fast_default_opt_out.unwrap_or(false),
+            account_plan_type,
+            config.features.enabled(Feature::FastMode),
+        );
         let session_configuration = SessionConfiguration {
             provider: config.model_provider.clone(),
             collaboration_mode,
             model_reasoning_summary: config.model_reasoning_summary,
-            service_tier: config.service_tier,
+            service_tier,
             developer_instructions: config.developer_instructions.clone(),
             user_instructions,
             personality: config.personality,
@@ -650,8 +664,10 @@ impl Codex {
             mcp_manager.clone(),
             skills_watcher,
             agent_control,
-            environment,
+            environment_manager,
             analytics_events_client,
+            thread_store,
+            inherited_rollout_trace,
         )
         .await
         .map_err(|e| {
@@ -783,6 +799,27 @@ impl Codex {
     pub(crate) fn enabled(&self, feature: Feature) -> bool {
         self.session.enabled(feature)
     }
+}
+
+fn get_service_tier(
+    configured_service_tier: Option<ServiceTier>,
+    fast_default_opt_out: bool,
+    account_plan_type: Option<AccountPlanType>,
+    fast_mode_enabled: bool,
+) -> Option<ServiceTier> {
+    if configured_service_tier.is_some() || fast_default_opt_out || !fast_mode_enabled {
+        return configured_service_tier;
+    }
+
+    account_plan_type
+        .is_some_and(is_enterprise_default_service_tier_plan)
+        .then_some(ServiceTier::Fast)
+}
+
+fn is_enterprise_default_service_tier_plan(plan_type: AccountPlanType) -> bool {
+    plan_type == AccountPlanType::Enterprise
+        || plan_type.is_business_like()
+        || plan_type.is_team_like()
 }
 
 #[cfg(test)]
@@ -982,58 +1019,6 @@ impl Session {
         });
     }
 
-    fn start_agent_identity_registration(self: &Arc<Self>) {
-        if !self.services.agent_identity_manager.is_enabled() {
-            return;
-        }
-
-        let weak_sess = Arc::downgrade(self);
-        let mut auth_state_rx = self.services.auth_manager.subscribe_auth_state();
-        tokio::spawn(async move {
-            loop {
-                let Some(sess) = weak_sess.upgrade() else {
-                    return;
-                };
-                match sess
-                    .services
-                    .agent_identity_manager
-                    .ensure_registered_identity()
-                    .await
-                {
-                    Ok(Some(_)) => {
-                        sess.maybe_prewarm_agent_task_registration().await;
-                        return;
-                    }
-                    Ok(None) => {
-                        drop(sess);
-                        if auth_state_rx.changed().await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        sess.fail_agent_identity_registration(error).await;
-                        return;
-                    }
-                }
-            }
-        });
-    }
-
-    async fn fail_agent_identity_registration(self: &Arc<Self>, error: anyhow::Error) {
-        warn!(error = %error, "agent identity registration failed");
-        let message = format!(
-            "Agent identity registration failed while `features.use_agent_identity` is enabled: {error}"
-        );
-        self.send_event_raw(Event {
-            id: self.next_internal_sub_id(),
-            msg: EventMsg::Error(ErrorEvent {
-                message,
-                codex_error_info: Some(CodexErrorInfo::Other),
-            }),
-        })
-        .await;
-    }
-
     pub(crate) fn get_tx_event(&self) -> Sender<Event> {
         self.tx_event.clone()
     }
@@ -1042,33 +1027,37 @@ impl Session {
         self.services.state_db.clone()
     }
 
+    pub(crate) fn live_thread_for_persistence(
+        &self,
+        operation: &str,
+    ) -> anyhow::Result<&LiveThread> {
+        self.live_thread()
+            .ok_or_else(|| anyhow::anyhow!("Session persistence is disabled; cannot {operation}."))
+    }
+
+    pub(crate) fn live_thread(&self) -> Option<&LiveThread> {
+        self.services.live_thread.as_ref()
+    }
+
     /// Flush rollout writes and return the final durability-barrier result.
     pub(crate) async fn flush_rollout(&self) -> std::io::Result<()> {
-        let recorder = {
-            let guard = self.services.rollout.lock().await;
-            guard.clone()
-        };
-        if let Some(recorder) = recorder {
-            recorder.flush().await
+        if let Some(live_thread) = self.live_thread() {
+            live_thread.flush().await.map_err(std::io::Error::other)
         } else {
             Ok(())
         }
     }
 
     pub(crate) async fn try_ensure_rollout_materialized(&self) -> std::io::Result<()> {
-        let recorder = {
-            let guard = self.services.rollout.lock().await;
-            guard.clone()
-        };
-        if let Some(rec) = recorder {
-            rec.persist().await?;
+        if let Some(live_thread) = self.live_thread() {
+            live_thread.persist().await.map_err(std::io::Error::other)?;
         }
         Ok(())
     }
 
     pub(crate) async fn ensure_rollout_materialized(&self) {
         if let Err(e) = self.try_ensure_rollout_materialized().await {
-            warn!("failed to materialize rollout recorder: {e}");
+            warn!("failed to materialize thread persistence: {e}");
         }
     }
 
@@ -1084,6 +1073,7 @@ impl Session {
             self,
             self.next_internal_sub_id(),
             Op::UserInput {
+                environments: None,
                 items: vec![UserInput::Text {
                     text,
                     text_elements: Vec::new(),
@@ -1181,7 +1171,6 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => {
                 let rollout_items = resumed_history.history;
-                self.restore_persisted_agent_task(&rollout_items).await;
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
@@ -1230,7 +1219,7 @@ impl Session {
                     state.set_token_info(Some(info));
                 }
 
-                // If persisting, persist all rollout items as-is (recorder filters)
+                // If persisting, persist all rollout items as-is (the store filters).
                 if !rollout_items.is_empty() {
                     self.persist_rollout_items(&rollout_items).await;
                 }
@@ -1359,6 +1348,14 @@ impl Session {
         }
 
         Ok(())
+    }
+
+    pub(crate) async fn validate_settings(
+        &self,
+        updates: &SessionSettingsUpdate,
+    ) -> ConstraintResult<()> {
+        let state = self.state.lock().await;
+        state.session_configuration.apply(updates).map(|_| ())
     }
 
     pub(crate) async fn set_session_startup_prewarm(
@@ -1565,7 +1562,7 @@ impl Session {
     }
 
     pub(crate) async fn send_event_raw(&self, event: Event) {
-        // Persist the event into rollout (recorder filters as needed)
+        // Persist the event into rollout storage (the store filters as needed).
         let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
         self.persist_rollout_items(&rollout_items).await;
         self.deliver_event_raw(event).await;
@@ -1938,6 +1935,7 @@ impl Session {
                 return Some(RequestPermissionsResponse {
                     permissions: RequestPermissionProfile::default(),
                     scope: PermissionGrantScope::Turn,
+                    strict_auto_review: false,
                 });
             }
             AskForApproval::Granular(granular_config)
@@ -1946,6 +1944,7 @@ impl Session {
                 return Some(RequestPermissionsResponse {
                     permissions: RequestPermissionProfile::default(),
                     scope: PermissionGrantScope::Turn,
+                    strict_auto_review: false,
                 });
             }
             AskForApproval::OnFailure
@@ -1976,6 +1975,7 @@ impl Session {
                 review_id,
                 request,
                 /*retry_reason*/ None,
+                codex_analytics::GuardianApprovalRequestSource::MainTurn,
                 cancellation_token.clone(),
             );
             let decision = tokio::select! {
@@ -1988,11 +1988,13 @@ impl Session {
                     RequestPermissionsResponse {
                         permissions: requested_permissions.clone(),
                         scope: PermissionGrantScope::Turn,
+                        strict_auto_review: false,
                     }
                 }
                 ReviewDecision::ApprovedForSession => RequestPermissionsResponse {
                     permissions: requested_permissions.clone(),
                     scope: PermissionGrantScope::Session,
+                    strict_auto_review: false,
                 },
                 ReviewDecision::NetworkPolicyAmendment {
                     network_policy_amendment,
@@ -2000,16 +2002,19 @@ impl Session {
                     NetworkPolicyRuleAction::Allow => RequestPermissionsResponse {
                         permissions: requested_permissions.clone(),
                         scope: PermissionGrantScope::Turn,
+                        strict_auto_review: false,
                     },
                     NetworkPolicyRuleAction::Deny => RequestPermissionsResponse {
                         permissions: RequestPermissionProfile::default(),
                         scope: PermissionGrantScope::Turn,
+                        strict_auto_review: false,
                     },
                 },
                 ReviewDecision::Abort | ReviewDecision::Denied | ReviewDecision::TimedOut => {
                     RequestPermissionsResponse {
                         permissions: RequestPermissionProfile::default(),
                         scope: PermissionGrantScope::Turn,
+                        strict_auto_review: false,
                     }
                 }
             };
@@ -2181,6 +2186,14 @@ impl Session {
         response: RequestPermissionsResponse,
         cwd: &Path,
     ) -> RequestPermissionsResponse {
+        if response.strict_auto_review && matches!(response.scope, PermissionGrantScope::Session) {
+            return RequestPermissionsResponse {
+                permissions: RequestPermissionProfile::default(),
+                scope: PermissionGrantScope::Turn,
+                strict_auto_review: false,
+            };
+        }
+
         if response.permissions.is_empty() {
             return response;
         }
@@ -2193,6 +2206,7 @@ impl Session {
             )
             .into(),
             scope: response.scope,
+            strict_auto_review: response.strict_auto_review,
         }
     }
 
@@ -2208,7 +2222,11 @@ impl Session {
             PermissionGrantScope::Turn => {
                 if let Some(turn_state) = originating_turn_state {
                     let mut ts = turn_state.lock().await;
-                    ts.record_granted_permissions(response.permissions.clone().into());
+                    let permissions: PermissionProfile = response.permissions.clone().into();
+                    ts.record_granted_permissions(permissions);
+                    if response.strict_auto_review {
+                        ts.enable_strict_auto_review();
+                    }
                 }
             }
             PermissionGrantScope::Session => {
@@ -2227,6 +2245,19 @@ impl Session {
         let active = active.as_ref()?;
         let ts = active.turn_state.lock().await;
         ts.granted_permissions()
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn reads must stay consistent with the matching turn state"
+    )]
+    pub(crate) async fn strict_auto_review_enabled_for_turn(&self) -> bool {
+        let active = self.active_turn.lock().await;
+        let Some(active) = active.as_ref() else {
+            return false;
+        };
+        let ts = active.turn_state.lock().await;
+        ts.strict_auto_review_enabled()
     }
 
     pub(crate) async fn granted_session_permissions(&self) -> Option<PermissionProfile> {
@@ -2362,6 +2393,18 @@ impl Session {
         self.record_model_warning(warning_message, turn_context)
             .await;
         true
+    }
+
+    pub(crate) async fn emit_model_verification(
+        self: &Arc<Self>,
+        turn_context: &Arc<TurnContext>,
+        verifications: Vec<ModelVerification>,
+    ) {
+        self.send_event(
+            turn_context,
+            EventMsg::ModelVerification(ModelVerificationEvent { verifications }),
+        )
+        .await;
     }
 
     pub(crate) async fn replace_history(
@@ -2551,13 +2594,13 @@ impl Session {
                 },
             );
             if let Some(available_skills) = available_skills {
-                let emit_warning = available_skills.emit_warning;
+                let warning_message = available_skills.warning_message.clone();
                 let skills_instructions = AvailableSkillsInstructions::from(available_skills);
-                if emit_warning {
+                if let Some(warning_message) = warning_message {
                     self.send_event_raw(Event {
                         id: String::new(),
                         msg: EventMsg::Warning(WarningEvent {
-                            message: THREAD_START_SKILLS_TRIMMED_WARNING_MESSAGE.to_string(),
+                            message: warning_message,
                         }),
                     })
                     .await;
@@ -2631,12 +2674,8 @@ impl Session {
     }
 
     pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
-        let recorder = {
-            let guard = self.services.rollout.lock().await;
-            guard.clone()
-        };
-        if let Some(rec) = recorder
-            && let Err(e) = rec.record_items(items).await
+        if let Some(live_thread) = self.live_thread()
+            && let Err(e) = live_thread.append_items(items).await
         {
             error!("failed to record rollout items: {e:#}");
         }
@@ -3032,6 +3071,10 @@ impl Session {
         self.mailbox_rx.lock().await.has_pending_trigger_turn()
     }
 
+    pub(crate) async fn has_pending_mailbox_items(&self) -> bool {
+        self.mailbox_rx.lock().await.has_pending()
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
@@ -3089,7 +3132,6 @@ impl Session {
     }
 
     /// Queue response items to be injected into the next active turn created for this session.
-    #[cfg(test)]
     pub(crate) async fn queue_response_items_for_next_turn(&self, items: Vec<ResponseInputItem>) {
         if items.is_empty() {
             return;
@@ -3131,7 +3173,7 @@ impl Session {
         if !accepts_mailbox_delivery {
             return false;
         }
-        self.mailbox_rx.lock().await.has_pending()
+        self.has_pending_mailbox_items().await
     }
 
     pub async fn interrupt_task(self: &Arc<Self>) {
@@ -3152,17 +3194,22 @@ impl Session {
         Arc::clone(&self.services.user_shell)
     }
 
-    pub(crate) async fn current_rollout_path(&self) -> Option<PathBuf> {
-        let recorder = {
-            let guard = self.services.rollout.lock().await;
-            guard.clone()
+    pub(crate) async fn current_rollout_path(&self) -> anyhow::Result<Option<PathBuf>> {
+        let Some(live_thread) = self.live_thread() else {
+            return Ok(None);
         };
-        recorder.map(|recorder| recorder.rollout_path().to_path_buf())
+        live_thread.local_rollout_path().await.map_err(Into::into)
     }
 
     pub(crate) async fn hook_transcript_path(&self) -> Option<PathBuf> {
         self.ensure_rollout_materialized().await;
-        self.current_rollout_path().await
+        match self.current_rollout_path().await {
+            Ok(path) => path,
+            Err(err) => {
+                warn!("{err}");
+                None
+            }
+        }
     }
 
     pub(crate) async fn take_pending_session_start_source(
